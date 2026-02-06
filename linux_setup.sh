@@ -505,7 +505,29 @@ EOF
             log_info "System76 hardware detected - installing System76 drivers..."
             if sudo apt-add-repository -y ppa:system76-dev/stable >> "$LOG_FILE" 2>&1; then
                 sudo apt-get update >> "$LOG_FILE" 2>&1
-                install_package "system76-driver" "System76 Driver"
+                
+                # Pre-configure Secure Boot MOK enrollment for DKMS modules
+                # Password "system76" will be needed at reboot to complete MOK enrollment
+                MOK_PASSWORD="system76"
+                log_info "Pre-configuring Secure Boot MOK enrollment..."
+                echo "shim-signed shim/mok_password password $MOK_PASSWORD" | sudo debconf-set-selections
+                echo "shim-signed shim/mok_password_again password $MOK_PASSWORD" | sudo debconf-set-selections
+                
+                log_info "Installing System76 Driver (this may take a while for DKMS modules)..."
+                if sudo apt-get install -y system76-driver >> "$LOG_FILE" 2>&1; then
+                    log_success "System76 Driver installed successfully"
+                    MANUAL_STEPS+=("SECURE BOOT MOK ENROLLMENT (System76):")
+                    MANUAL_STEPS+=("  1. Ensure Secure Boot is ENABLED in BIOS (F2 at boot → Security → Secure Boot)")
+                    MANUAL_STEPS+=("  2. Save and exit BIOS, system will reboot")
+                    MANUAL_STEPS+=("  3. You will see a blue 'MOK Management' screen")
+                    MANUAL_STEPS+=("  4. Select 'Enroll MOK' → 'Continue' → 'Yes'")
+                    MANUAL_STEPS+=("  5. Enter password: $MOK_PASSWORD")
+                    MANUAL_STEPS+=("  6. Select 'Reboot'")
+                    MANUAL_STEPS+=("")
+                else
+                    log_error "Failed to install System76 Driver"
+                    FAILED_PACKAGES+=("system76-driver - System76 Driver")
+                fi
             else
                 log_error "Failed to add System76 PPA"
                 FAILED_PACKAGES+=("system76-driver - System76 Driver (PPA setup failed)")
