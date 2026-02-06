@@ -516,13 +516,10 @@ EOF
                 log_info "Installing System76 Driver (this may take a while for DKMS modules)..."
                 if sudo apt-get install -y system76-driver >> "$LOG_FILE" 2>&1; then
                     log_success "System76 Driver installed successfully"
-                    MANUAL_STEPS+=("SECURE BOOT MOK ENROLLMENT (System76):")
-                    MANUAL_STEPS+=("  1. Ensure Secure Boot is ENABLED in BIOS (F2 at boot → Security → Secure Boot)")
-                    MANUAL_STEPS+=("  2. Save and exit BIOS, system will reboot")
-                    MANUAL_STEPS+=("  3. You will see a blue 'MOK Management' screen")
-                    MANUAL_STEPS+=("  4. Select 'Enroll MOK' → 'Continue' → 'Yes'")
-                    MANUAL_STEPS+=("  5. Enter password: $MOK_PASSWORD")
-                    MANUAL_STEPS+=("  6. Select 'Reboot'")
+                    MANUAL_STEPS+=("SECURE BOOT (System76) - Only if you need Secure Boot enabled:")
+                    MANUAL_STEPS+=("  Note: System76 drivers may have issues with Secure Boot.")
+                    MANUAL_STEPS+=("  If Secure Boot is required, see SECURE_BOOT_FIX.md for steps.")
+                    MANUAL_STEPS+=("  Otherwise, leave Secure Boot disabled - everything works fine.")
                     MANUAL_STEPS+=("")
                 else
                     log_error "Failed to install System76 Driver"
