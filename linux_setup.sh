@@ -422,7 +422,7 @@ setup_general() {
     log_info "Setting up Claude Code with AWS Bedrock..."
 
     # Install Claude Code
-    if command -v claude &> /dev/null; then
+    if sudo -u $SUDO_USER bash -c 'command -v claude' &> /dev/null || [ -f "/home/$SUDO_USER/.claude/local/claude" ]; then
         log_success "Claude Code already installed"
     else
         log_info "Installing Claude Code..."
