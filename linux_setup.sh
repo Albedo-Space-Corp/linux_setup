@@ -506,9 +506,6 @@ EOF
             if sudo apt-add-repository -y ppa:system76-dev/stable >> "$LOG_FILE" 2>&1; then
                 sudo apt-get update >> "$LOG_FILE" 2>&1
                 install_package "system76-driver" "System76 Driver"
-                log_info "Running system upgrade for System76 drivers..."
-                sudo apt-get upgrade -y >> "$LOG_FILE" 2>&1
-                log_success "System76 drivers installed and system upgraded"
             else
                 log_error "Failed to add System76 PPA"
                 FAILED_PACKAGES+=("system76-driver - System76 Driver (PPA setup failed)")
