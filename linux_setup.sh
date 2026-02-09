@@ -417,6 +417,27 @@ setup_general() {
         log_warning "Snap not available, skipping Slack installation"
         FAILED_PACKAGES+=("slack - Slack (snap not available)")
     fi
+    
+    # Install 1Password
+    # Reference: https://support.1password.com/install-linux/#debian-or-ubuntu
+    log_info "Installing 1Password..."
+    if dpkg -l | grep -q "^ii  1password "; then
+        local version=$(dpkg -l | grep "^ii  1password " | awk '{print $3}' | head -1)
+        log_success "1Password already installed (version $version)"
+    else
+        if curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg 2>> "$LOG_FILE"; then
+            echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' | sudo tee /etc/apt/sources.list.d/1password.list >> "$LOG_FILE"
+            sudo mkdir -p /etc/debsig/policies/AC2D62742012EA22/ >> "$LOG_FILE" 2>&1
+            curl -sS https://downloads.1password.com/linux/debian/debsig/1password.pol | sudo tee /etc/debsig/policies/AC2D62742012EA22/1password.pol >> "$LOG_FILE" 2>&1
+            sudo mkdir -p /usr/share/debsig/keyrings/AC2D62742012EA22 >> "$LOG_FILE" 2>&1
+            curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg 2>> "$LOG_FILE"
+            sudo apt-get update >> "$LOG_FILE" 2>&1
+            install_package "1password" "1Password"
+        else
+            log_error "Failed to setup 1Password repository"
+            FAILED_PACKAGES+=("1password - 1Password (repo setup failed)")
+        fi
+    fi
 
     # Install Claude Code with Bedrock support
     log_info "Setting up Claude Code with AWS Bedrock..."
@@ -691,21 +712,6 @@ setup_fsw() {
             log_error "Failed to download Docker installation script"
             FAILED_PACKAGES+=("docker - Docker Engine (download failed)")
         fi
-    fi
-    
-    # Install 1Password
-    log_info "Installing 1Password..."
-    if curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg 2>> "$LOG_FILE"; then
-        echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' | sudo tee /etc/apt/sources.list.d/1password.list >> "$LOG_FILE"
-        sudo mkdir -p /etc/debsig/policies/AC2D62742012EA22/ >> "$LOG_FILE" 2>&1
-        curl -sS https://downloads.1password.com/linux/debian/debsig/1password.pol | sudo tee /etc/debsig/policies/AC2D62742012EA22/1password.pol >> "$LOG_FILE" 2>&1
-        sudo mkdir -p /usr/share/debsig/keyrings/AC2D62742012EA22 >> "$LOG_FILE" 2>&1
-        curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg 2>> "$LOG_FILE"
-        sudo apt-get update >> "$LOG_FILE" 2>&1
-        install_package "1password" "1Password"
-    else
-        log_error "Failed to setup 1Password repository"
-        FAILED_PACKAGES+=("1password - 1Password (repo setup failed)")
     fi
     
     # Install SonicWall NetExtender
