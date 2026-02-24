@@ -45,6 +45,68 @@ generate_password() {
     echo "$password"
 }
 
+# Function to prompt for admin password or auto-generate one
+# Sets ADMIN_PASSWORD and ADMIN_PASSWORD_GENERATED (true if auto-generated)
+prompt_admin_password() {
+    ADMIN_PASSWORD_GENERATED=false
+
+    if [[ "$SKIP_PROMPTS" == "true" ]] || ! [[ -t 0 ]]; then
+        # Non-interactive: auto-generate
+        ADMIN_PASSWORD=$(generate_password 24)
+        ADMIN_PASSWORD_GENERATED=true
+        return 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Set the password for the albedo_admin account.${NC}"
+    echo -e "${YELLOW}Press Enter to auto-generate a secure password instead.${NC}"
+    echo ""
+
+    while true; do
+        read -s -r -p "Enter password (or Enter to auto-generate): " user_pw
+        echo ""
+
+        if [[ -z "$user_pw" ]]; then
+            ADMIN_PASSWORD=$(generate_password 24)
+            ADMIN_PASSWORD_GENERATED=true
+            return 0
+        fi
+
+        local pw_errors=()
+        if [[ ${#user_pw} -lt 12 ]]; then
+            pw_errors+=("at least 12 characters")
+        fi
+        if ! [[ "$user_pw" =~ [A-Z] ]]; then
+            pw_errors+=("an uppercase letter")
+        fi
+        if ! [[ "$user_pw" =~ [a-z] ]]; then
+            pw_errors+=("a lowercase letter")
+        fi
+        if ! [[ "$user_pw" =~ [0-9] ]]; then
+            pw_errors+=("a number")
+        fi
+        if ! [[ "$user_pw" =~ [^a-zA-Z0-9] ]]; then
+            pw_errors+=("a special character")
+        fi
+        if [[ ${#pw_errors[@]} -gt 0 ]]; then
+            echo -e "${RED}Password must contain: $(IFS=', '; echo "${pw_errors[*]}"). Try again.${NC}"
+            continue
+        fi
+
+        read -s -r -p "Confirm password: " user_pw_confirm
+        echo ""
+
+        if [[ "$user_pw" != "$user_pw_confirm" ]]; then
+            echo -e "${RED}Passwords do not match. Try again.${NC}"
+            continue
+        fi
+
+        ADMIN_PASSWORD="$user_pw"
+        unset user_pw user_pw_confirm
+        return 0
+    done
+}
+
 # Function to check if script is running interactively
 is_interactive() {
     [[ $- == *i* ]] && [[ -t 0 ]] && [[ -t 1 ]]
@@ -304,8 +366,7 @@ setup_general() {
         
         if [[ "$SHOULD_RESET_PASSWORD" == "true" ]]; then
             log_info "Resetting albedo_admin password..."
-            # Generate a new password and set it
-            ADMIN_PASSWORD=$(generate_password 24)
+            prompt_admin_password
             if echo "albedo_admin:$ADMIN_PASSWORD" | sudo chpasswd >> "$LOG_FILE" 2>&1; then
                 log_success "albedo_admin password reset successfully"
             else
@@ -316,8 +377,7 @@ setup_general() {
         fi
     else
         log_info "Creating new albedo_admin user..."
-        # Generate a secure 24-character password
-        ADMIN_PASSWORD=$(generate_password 24)
+        prompt_admin_password
         
         # Create the user with home directory
         if sudo useradd -m -s /bin/bash albedo_admin >> "$LOG_FILE" 2>&1; then
@@ -342,7 +402,7 @@ setup_general() {
         fi
     fi
     
-    # Display password if we have one (either created new user or reset password)
+    # Display password info (only show the actual password if it was auto-generated)
     if [[ -n "$ADMIN_PASSWORD" ]]; then
         echo ""
         echo -e "${RED}=================================${NC}"
@@ -353,13 +413,17 @@ setup_general() {
         fi
         echo -e "${RED}=================================${NC}"
         echo -e "${YELLOW}Username: ${GREEN}albedo_admin${NC}"
-        echo -e "${YELLOW}Password: ${GREEN}$ADMIN_PASSWORD${NC}"
-        echo -e "${RED}=================================${NC}"
-        echo -e "${RED}SAVE THIS PASSWORD TO YOUR ${NC}"
-        echo -e "${RED}PASSWORD MANAGER IMMEDIATELY!${NC}"
+        if [[ "$ADMIN_PASSWORD_GENERATED" == "true" ]]; then
+            echo -e "${YELLOW}Password: ${GREEN}$ADMIN_PASSWORD${NC}"
+            echo -e "${RED}=================================${NC}"
+            echo -e "${RED}SAVE THIS PASSWORD TO YOUR ${NC}"
+            echo -e "${RED}PASSWORD MANAGER IMMEDIATELY!${NC}"
+        else
+            echo -e "${YELLOW}Password: ${GREEN}(set to your provided password)${NC}"
+        fi
         echo -e "${RED}=================================${NC}"
         echo ""
-        
+
         # Clear the password variable for security
         unset ADMIN_PASSWORD
     fi
@@ -441,81 +505,12 @@ setup_general() {
 
     # Install Claude Code with Bedrock support
     log_info "Setting up Claude Code with AWS Bedrock..."
-
-    # Install Claude Code
-    if sudo -u $SUDO_USER bash -c 'command -v claude' &> /dev/null || [ -f "/home/$SUDO_USER/.claude/local/claude" ]; then
-        log_success "Claude Code already installed"
+    log_info "Running Claude Code Bedrock setup script (setup_ccb.sh)..."
+    if sudo -u $SUDO_USER bash <(curl -fsSL https://raw.githubusercontent.com/Albedo-Space-Corp/claude_code/refs/heads/main/setup_ccb.sh); then
+        log_success "Claude Code Bedrock setup completed successfully"
     else
-        log_info "Installing Claude Code..."
-        if curl -fsSL claude.ai/install.sh | sudo -u $SUDO_USER bash >> "$LOG_FILE" 2>&1; then
-            log_success "Claude Code installed successfully"
-        else
-            log_error "Failed to install Claude Code"
-            FAILED_PACKAGES+=("claude - Claude Code")
-        fi
-    fi
-
-    # Setup AWS Bedrock profile for Claude Code
-    log_info "Configuring AWS Bedrock profile..."
-    AWS_CONFIG_FILE="/home/$SUDO_USER/.aws/config"
-
-    if [ -f "$AWS_CONFIG_FILE" ]; then
-        if grep -q "\[profile prod-it01-bedrock\]" "$AWS_CONFIG_FILE"; then
-            log_success "AWS prod-it01-bedrock profile already configured"
-        else
-            log_info "Adding prod-it01-bedrock profile to AWS config..."
-            sudo -u $SUDO_USER bash -c "cat >> $AWS_CONFIG_FILE" << 'EOF'
-
-[profile prod-it01-bedrock]
-region = us-west-2
-output = json
-sso_start_url = https://albedo.awsapps.com/start
-sso_region = us-west-2
-sso_account_id = 188343044386
-sso_role_name = AlbedoBedrockUsers
-sso_registration_scopes = sso:account:access
-EOF
-            log_success "AWS prod-it01-bedrock profile added"
-        fi
-    else
-        log_info "Creating AWS config file with prod-it01-bedrock profile..."
-        sudo -u $SUDO_USER mkdir -p "/home/$SUDO_USER/.aws" >> "$LOG_FILE" 2>&1
-        sudo -u $SUDO_USER bash -c "cat > $AWS_CONFIG_FILE" << 'EOF'
-[profile prod-it01-bedrock]
-region = us-west-2
-output = json
-sso_start_url = https://albedo.awsapps.com/start
-sso_region = us-west-2
-sso_account_id = 188343044386
-sso_role_name = AlbedoBedrockUsers
-sso_registration_scopes = sso:account:access
-EOF
-        log_success "AWS config file created with prod-it01-bedrock profile"
-    fi
-
-    # Download claude_bedrock.sh wrapper script
-    log_info "Installing claude_bedrock.sh wrapper script..."
-    sudo -u $SUDO_USER mkdir -p "/home/$SUDO_USER/bin" >> "$LOG_FILE" 2>&1
-
-    CLAUDE_SCRIPT="/home/$SUDO_USER/bin/claude_bedrock.sh"
-    DOWNLOAD_URL="https://raw.githubusercontent.com/Albedo-Space-Corp/claude_code/refs/heads/main/claude_bedrock.sh"
-
-    if curl -fsSL "$DOWNLOAD_URL" -o "$CLAUDE_SCRIPT" >> "$LOG_FILE" 2>&1; then
-        chmod +x "$CLAUDE_SCRIPT" >> "$LOG_FILE" 2>&1
-        sudo chown $SUDO_USER:$SUDO_USER "$CLAUDE_SCRIPT" >> "$LOG_FILE" 2>&1
-        log_success "claude_bedrock.sh installed successfully"
-    else
-        log_error "Failed to download claude_bedrock.sh"
-        FAILED_PACKAGES+=("claude_bedrock.sh - Claude Bedrock wrapper script")
-    fi
-
-    # Add ~/bin to PATH if not already there
-    if ! grep -q 'export PATH="$HOME/bin:$PATH"' "/home/$SUDO_USER/.bashrc"; then
-        log_info "Adding ~/bin to PATH..."
-        sudo -u $SUDO_USER bash -c 'echo "" >> ~/.bashrc'
-        sudo -u $SUDO_USER bash -c 'echo "# Add personal bin directory to PATH" >> ~/.bashrc'
-        sudo -u $SUDO_USER bash -c 'echo "export PATH=\"\$HOME/bin:\$PATH\"" >> ~/.bashrc'
-        log_success "~/bin added to PATH"
+        log_error "Claude Code Bedrock setup failed"
+        FAILED_PACKAGES+=("claude - Claude Code Bedrock setup")
     fi
     
     # Install System76 drivers if this is a System76 machine
@@ -660,8 +655,8 @@ EOF
     MANUAL_STEPS+=("8. Configure Slack workspaces (albedo.enterprise and albedo-enterprise)")
     MANUAL_STEPS+=("9. Setup Claude Code with Bedrock:")
     MANUAL_STEPS+=("   - Open a new terminal (to reload PATH)")
-    MANUAL_STEPS+=("   - Run: claude_bedrock.sh")
-    MANUAL_STEPS+=("   - Follow AWS SSO login prompts")
+    MANUAL_STEPS+=("   - Run: claude")
+    MANUAL_STEPS+=("   - Follow AWS SSO login prompts if session expired")
     MANUAL_STEPS+=("   - Claude Code will launch with Opus/Sonnet models")
     MANUAL_STEPS+=("")
     
