@@ -34,15 +34,8 @@ log() {
 # Function to generate a secure random password
 generate_password() {
     local length=${1:-24}
-    # Use a mix of uppercase, lowercase, numbers, and safe special characters
-    local chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?'
-    local password=""
-    
-    for i in $(seq 1 $length); do
-        password="${password}${chars:RANDOM%${#chars}:1}"
-    done
-    
-    echo "$password"
+    # Use /dev/urandom for cryptographic randomness, filtered to printable chars
+    { LC_ALL=C tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' < /dev/urandom || true; } | head -c "$length"
 }
 
 # Function to prompt for admin password or auto-generate one
@@ -246,6 +239,142 @@ install_deb_package() {
         FAILED_PACKAGES+=("$filename - $description (download failed)")
         return 1
     fi
+}
+
+# TPM2 auto-unlock setup via Clevis
+# Binds LUKS encryption to the TPM2 chip so the drive auto-unlocks at boot
+# PCR 7 = Secure Boot state (detects tampering, stable across kernel updates)
+setup_tpm2_autounlock() {
+    log_info "Setting up TPM2 LUKS auto-unlock..."
+
+    # Check for TPM2 device — /dev/tpmrm0 is TPM2-specific (doesn't exist on TPM 1.2)
+    if [ -e /dev/tpmrm0 ]; then
+        log_info "TPM2 resource manager device found (/dev/tpmrm0)"
+    elif [ -e /dev/tpm0 ]; then
+        # /dev/tpm0 exists on both TPM 1.2 and 2.0 — verify version if tools are available
+        if command -v tpm2_getcap &>/dev/null && tpm2_getcap properties-fixed 2>/dev/null | grep -q 'TPM_PT_FAMILY_INDICATOR.*2.0'; then
+            log_info "TPM2 device confirmed via tpm2_getcap"
+        else
+            log_warning "TPM device found but cannot confirm TPM2 - skipping auto-unlock setup"
+            MANUAL_STEPS+=("TPM2: Found /dev/tpm0 but could not confirm TPM2. Verify BIOS settings and re-run.")
+            return 0
+        fi
+    else
+        log_warning "No TPM device found - skipping auto-unlock setup"
+        MANUAL_STEPS+=("TPM2: No TPM device detected. Enable TPM in BIOS and re-run to enable auto-unlock.")
+        return 0
+    fi
+
+    # Auto-detect LUKS partition
+    LUKS_DEV=$(lsblk -rno NAME,FSTYPE | awk '$2=="crypto_LUKS"{print "/dev/"$1}' | head -1)
+    if [ -z "$LUKS_DEV" ]; then
+        log_warning "No LUKS partition detected - skipping auto-unlock setup"
+        return 0
+    fi
+
+    log_info "Detected LUKS partition: $LUKS_DEV"
+
+    # Check if Clevis is already bound to TPM2 on this device
+    if command -v clevis &>/dev/null && clevis luks list -d "$LUKS_DEV" 2>/dev/null | grep -q tpm2; then
+        log_success "TPM2 auto-unlock already configured for $LUKS_DEV"
+        return 0
+    fi
+
+    # TPM2 binding requires the LUKS passphrase — skip in non-interactive mode
+    if [[ "$SKIP_PROMPTS" == "true" ]] || ! [[ -t 0 ]]; then
+        log_warning "TPM2 auto-unlock requires LUKS passphrase - skipping in non-interactive mode"
+        MANUAL_STEPS+=("TPM2 AUTO-UNLOCK: Run setup interactively to enable (requires LUKS passphrase)")
+        return 0
+    fi
+
+    # Prompt for LUKS passphrase
+    echo ""
+    echo -e "${YELLOW}TPM2 Auto-Unlock Setup${NC}"
+    echo -e "${YELLOW}Enter your LUKS disk encryption passphrase to enable auto-unlock at boot.${NC}"
+    echo -e "${YELLOW}Your original passphrase will still work as a fallback.${NC}"
+    echo ""
+    read -s -r -p "Enter LUKS passphrase: " LUKS_PASSPHRASE
+    echo ""
+
+    # Verify the passphrase is correct before proceeding
+    if ! echo -n "$LUKS_PASSPHRASE" | cryptsetup luksOpen --test-passphrase --key-file - "$LUKS_DEV" 2>/dev/null; then
+        log_error "Invalid LUKS passphrase - skipping TPM2 auto-unlock"
+        unset LUKS_PASSPHRASE
+        return 1
+    fi
+
+    # Install Clevis packages
+    install_package "clevis" "Clevis"
+    install_package "clevis-tpm2" "Clevis TPM2"
+    install_package "clevis-luks" "Clevis LUKS"
+    install_package "clevis-initramfs" "Clevis Initramfs"
+
+    # Create secure temp files for keyfile-based operations
+    LUKS_KEYFILE=$(mktemp /tmp/luks_key.XXXXXX)
+    TEMP_KEYFILE=$(mktemp /tmp/luks_tmp.XXXXXX)
+    chmod 600 "$LUKS_KEYFILE" "$TEMP_KEYFILE"
+
+    # Ensure keyfiles are always cleaned up, even on unexpected exit (set -e)
+    trap 'shred -u "$LUKS_KEYFILE" "$TEMP_KEYFILE" 2>/dev/null; trap - RETURN EXIT' RETURN EXIT
+
+    echo -n "$LUKS_PASSPHRASE" > "$LUKS_KEYFILE"
+    unset LUKS_PASSPHRASE
+
+    # Generate a cryptographically random temp key — Clevis can't authorize against
+    # argon2id (Ubuntu's default LUKS2 KDF), so we add a pbkdf2 key, bind with it, then remove it
+    dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 -w0 > "$TEMP_KEYFILE"
+
+    # Find two free LUKS key slots (one for temp key, one for Clevis)
+    TEMP_SLOT=$(cryptsetup luksDump "$LUKS_DEV" | awk '/^\s*[0-9]+: \(empty\)/{print $1+0; exit}')
+    if [ -z "$TEMP_SLOT" ]; then
+        log_error "No free LUKS key slots available"
+        return 1
+    fi
+    CLEVIS_SLOT=$(cryptsetup luksDump "$LUKS_DEV" | awk -v skip="$TEMP_SLOT" '/^\s*[0-9]+: \(empty\)/{s=$1+0; if(s!=skip){print s; exit}}')
+    if [ -z "$CLEVIS_SLOT" ]; then
+        log_error "Need at least 2 free LUKS key slots (only found 1)"
+        return 1
+    fi
+    log_info "Using LUKS slot $TEMP_SLOT for temp key, slot $CLEVIS_SLOT for Clevis"
+
+    # Add temporary pbkdf2 key
+    log_info "Adding temporary LUKS key for Clevis binding..."
+    if cryptsetup luksAddKey --key-slot "$TEMP_SLOT" --pbkdf pbkdf2 --key-file "$LUKS_KEYFILE" "$LUKS_DEV" "$TEMP_KEYFILE" >> "$LOG_FILE" 2>&1; then
+        log_success "Temporary key added to LUKS slot $TEMP_SLOT"
+    else
+        log_error "Failed to add temporary LUKS key"
+        return 1
+    fi
+
+    # Bind Clevis to TPM2 (PCR 7 = Secure Boot state)
+    log_info "Binding Clevis to TPM2 (this may take a moment)..."
+    if clevis luks bind -d "$LUKS_DEV" -s "$CLEVIS_SLOT" -k "$TEMP_KEYFILE" tpm2 '{"pcr_bank":"sha256","pcr_ids":"7"}' >> "$LOG_FILE" 2>&1; then
+        log_success "Clevis bound to TPM2 on slot $CLEVIS_SLOT (PCR 7)"
+    else
+        log_error "Failed to bind Clevis to TPM2 - cleaning up temporary key"
+        cryptsetup luksKillSlot --key-file "$LUKS_KEYFILE" "$LUKS_DEV" "$TEMP_SLOT" >> "$LOG_FILE" 2>&1
+        return 1
+    fi
+
+    # Remove temporary key
+    log_info "Removing temporary key from slot $TEMP_SLOT..."
+    if cryptsetup luksKillSlot --key-file "$LUKS_KEYFILE" "$LUKS_DEV" "$TEMP_SLOT" >> "$LOG_FILE" 2>&1; then
+        log_success "Temporary key removed from slot $TEMP_SLOT"
+    else
+        log_warning "Could not remove temporary key from slot $TEMP_SLOT - remove manually: sudo cryptsetup luksKillSlot $LUKS_DEV $TEMP_SLOT"
+    fi
+
+    # Rebuild initramfs so auto-unlock happens early enough in boot
+    log_info "Rebuilding initramfs (this may take a moment)..."
+    if update-initramfs -u -k all >> "$LOG_FILE" 2>&1; then
+        log_success "Initramfs rebuilt successfully"
+    else
+        log_error "Failed to rebuild initramfs - auto-unlock may not work until initramfs is rebuilt"
+        return 1
+    fi
+
+    log_success "TPM2 auto-unlock configured - drive will auto-unlock at boot"
+    log_info "Note: Changing Secure Boot settings will break auto-unlock. Re-run setup to rebind."
 }
 
 # Usage function
@@ -506,11 +635,18 @@ setup_general() {
     # Install Claude Code with Bedrock support
     log_info "Setting up Claude Code with AWS Bedrock..."
     log_info "Running Claude Code Bedrock setup script (setup_ccb.sh)..."
-    if sudo -u $SUDO_USER bash <(curl -fsSL https://raw.githubusercontent.com/Albedo-Space-Corp/claude_code/refs/heads/main/setup_ccb.sh); then
-        log_success "Claude Code Bedrock setup completed successfully"
+    CCB_SCRIPT=$(mktemp /tmp/setup_ccb.XXXXXX.sh)
+    if curl -fsSL "https://raw.githubusercontent.com/Albedo-Space-Corp/claude_code/refs/heads/main/setup_ccb.sh" -o "$CCB_SCRIPT" >> "$LOG_FILE" 2>&1; then
+        if sudo -u "$SUDO_USER" bash "$CCB_SCRIPT"; then
+            log_success "Claude Code Bedrock setup completed successfully"
+        else
+            log_error "Claude Code Bedrock setup failed"
+            FAILED_PACKAGES+=("claude - Claude Code Bedrock setup")
+        fi
+        rm -f "$CCB_SCRIPT"
     else
-        log_error "Claude Code Bedrock setup failed"
-        FAILED_PACKAGES+=("claude - Claude Code Bedrock setup")
+        log_error "Failed to download Claude Code Bedrock setup script"
+        FAILED_PACKAGES+=("claude - Claude Code Bedrock setup (download failed)")
     fi
     
     # Install System76 drivers if this is a System76 machine
@@ -643,6 +779,9 @@ EOF
         MANUAL_STEPS+=("Enable Intune startup: systemctl --user daemon-reload && systemctl --user enable intune-portal.service")
     fi
     
+    # Setup TPM2 auto-unlock for LUKS encrypted drive
+    setup_tpm2_autounlock
+
     # Add manual setup instructions for general
     MANUAL_STEPS+=("GENERAL SETUP COMPLETION:")
     MANUAL_STEPS+=("1. Reboot your device")
@@ -653,11 +792,7 @@ EOF
     MANUAL_STEPS+=("6. Configure screenshot shortcut (Settings → Keyboard → Custom: Shift+Win+S)")
     MANUAL_STEPS+=("7. Configure task manager shortcut (Custom: gnome-system-monitor, Ctrl+Shift+Esc)")
     MANUAL_STEPS+=("8. Configure Slack workspaces (albedo.enterprise and albedo-enterprise)")
-    MANUAL_STEPS+=("9. Setup Claude Code with Bedrock:")
-    MANUAL_STEPS+=("   - Open a new terminal (to reload PATH)")
-    MANUAL_STEPS+=("   - Run: claude")
-    MANUAL_STEPS+=("   - Follow AWS SSO login prompts if session expired")
-    MANUAL_STEPS+=("   - Claude Code will launch with Opus/Sonnet models")
+    MANUAL_STEPS+=("9. Open a new terminal (to reload PATH) and run: claude")
     MANUAL_STEPS+=("")
     
     log_success "General setup completed"
