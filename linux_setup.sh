@@ -20,7 +20,7 @@ NC='\033[0m' # No Color
 
 # Global variables
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="/tmp/linux-setup-$(date +%Y%m%d-%H%M%S).log"
+LOG_FILE="/var/log/linux-setup-$(date +%Y%m%d-%H%M%S).log"
 FAILED_PACKAGES=()
 MANUAL_STEPS=()
 RESET_ADMIN_PASSWORD=false
@@ -293,8 +293,19 @@ setup_tpm2_autounlock() {
     echo -e "${YELLOW}Enter your LUKS disk encryption passphrase to enable auto-unlock at boot.${NC}"
     echo -e "${YELLOW}Your original passphrase will still work as a fallback.${NC}"
     echo ""
-    read -s -r -p "Enter LUKS passphrase: " LUKS_PASSPHRASE
-    echo ""
+    # Prompt twice and require a match — hidden input has no typo feedback
+    while :; do
+        read -s -r -p "Enter LUKS passphrase: " LUKS_PASSPHRASE
+        echo ""
+        read -s -r -p "Confirm LUKS passphrase: " LUKS_PASSPHRASE_CONFIRM
+        echo ""
+        if [ "$LUKS_PASSPHRASE" = "$LUKS_PASSPHRASE_CONFIRM" ]; then
+            unset LUKS_PASSPHRASE_CONFIRM
+            break
+        fi
+        unset LUKS_PASSPHRASE_CONFIRM
+        echo -e "${YELLOW}Passphrases do not match. Try again.${NC}"
+    done
 
     # Verify the passphrase is correct before proceeding
     if ! echo -n "$LUKS_PASSPHRASE" | cryptsetup luksOpen --test-passphrase --key-file - "$LUKS_DEV" 2>/dev/null; then
@@ -324,17 +335,37 @@ setup_tpm2_autounlock() {
     # argon2id (Ubuntu's default LUKS2 KDF), so we add a pbkdf2 key, bind with it, then remove it
     dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 -w0 > "$TEMP_KEYFILE"
 
-    # Find two free LUKS key slots (one for temp key, one for Clevis)
-    TEMP_SLOT=$(cryptsetup luksDump "$LUKS_DEV" | awk '/^\s*[0-9]+: \(empty\)/{print $1+0; exit}')
-    if [ -z "$TEMP_SLOT" ]; then
-        log_error "No free LUKS key slots available"
+    # Find two free LUKS key slots (one for temp key, one for Clevis).
+    # LUKS2 luksDump only lists ALLOCATED slots under "Keyslots:", so we
+    # enumerate used slots and take the complement from the valid range.
+    # LUKS1 lists all 8 slots explicitly as "Key Slot N: ENABLED|DISABLED".
+    declare -A USED_SLOTS=()
+    LUKS_VERSION=$(cryptsetup luksDump "$LUKS_DEV" | awk '/^Version:/{print $2+0; exit}')
+    if [ "$LUKS_VERSION" = "1" ]; then
+        MAX_SLOT=7
+    else
+        MAX_SLOT=31
+    fi
+    while read -r slot; do
+        [ -n "$slot" ] && USED_SLOTS[$slot]=1
+    done < <(cryptsetup luksDump "$LUKS_DEV" | awk '
+        /^Keyslots:/                    { in_ks=1; next }
+        /^[^[:space:]]/                 { in_ks=0 }
+        in_ks && /^[[:space:]]+[0-9]+:/ { gsub(/:/, "", $1); print $1+0 }
+        /^Key Slot [0-9]+: ENABLED/     { print $3+0 }
+    ')
+    FREE_SLOTS=()
+    for slot in $(seq 0 "$MAX_SLOT"); do
+        if [ -z "${USED_SLOTS[$slot]:-}" ]; then
+            FREE_SLOTS+=("$slot")
+        fi
+    done
+    if [ "${#FREE_SLOTS[@]}" -lt 2 ]; then
+        log_error "Need at least 2 free LUKS key slots (found ${#FREE_SLOTS[@]} of $((MAX_SLOT+1)))"
         return 1
     fi
-    CLEVIS_SLOT=$(cryptsetup luksDump "$LUKS_DEV" | awk -v skip="$TEMP_SLOT" '/^\s*[0-9]+: \(empty\)/{s=$1+0; if(s!=skip){print s; exit}}')
-    if [ -z "$CLEVIS_SLOT" ]; then
-        log_error "Need at least 2 free LUKS key slots (only found 1)"
-        return 1
-    fi
+    TEMP_SLOT="${FREE_SLOTS[0]}"
+    CLEVIS_SLOT="${FREE_SLOTS[1]}"
     log_info "Using LUKS slot $TEMP_SLOT for temp key, slot $CLEVIS_SLOT for Clevis"
 
     # Add temporary pbkdf2 key
@@ -577,7 +608,7 @@ setup_general() {
     if curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /tmp/microsoft.gpg 2>> "$LOG_FILE"; then
         sudo install -o root -g root -m 644 /tmp/microsoft.gpg /usr/share/keyrings/ >> "$LOG_FILE" 2>&1
         rm -f /tmp/microsoft.gpg
-        sudo sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/$(lsb_release -rs)/prod $(lsb_release -cs) main" >> /etc/apt/sources.list.d/microsoft-ubuntu-$(lsb_release -cs)-prod.list' >> "$LOG_FILE" 2>&1
+        sudo sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/$(lsb_release -rs)/prod $(lsb_release -cs) main" > /etc/apt/sources.list.d/microsoft-ubuntu-$(lsb_release -cs)-prod.list' >> "$LOG_FILE" 2>&1
         sudo apt-get update >> "$LOG_FILE" 2>&1
         install_package "intune-portal" "Microsoft Intune Portal"
     else
@@ -618,31 +649,48 @@ setup_general() {
         local version=$(dpkg -l | grep "^ii  1password " | awk '{print $3}' | head -1)
         log_success "1Password already installed (version $version)"
     else
-        if curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg 2>> "$LOG_FILE"; then
+        if curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --yes --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg 2>> "$LOG_FILE"; then
             echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' | sudo tee /etc/apt/sources.list.d/1password.list >> "$LOG_FILE"
             sudo mkdir -p /etc/debsig/policies/AC2D62742012EA22/ >> "$LOG_FILE" 2>&1
             curl -sS https://downloads.1password.com/linux/debian/debsig/1password.pol | sudo tee /etc/debsig/policies/AC2D62742012EA22/1password.pol >> "$LOG_FILE" 2>&1
             sudo mkdir -p /usr/share/debsig/keyrings/AC2D62742012EA22 >> "$LOG_FILE" 2>&1
-            curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg 2>> "$LOG_FILE"
+            curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --yes --dearmor --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg 2>> "$LOG_FILE"
             sudo apt-get update >> "$LOG_FILE" 2>&1
             install_package "1password" "1Password"
+            # The 1password .deb postinst drops /etc/apt/sources.list.d/1password.sources
+            # (deb822 format). Our .list file becomes redundant and produces
+            # "configured multiple times" warnings on every apt update.
+            if [ -f /etc/apt/sources.list.d/1password.sources ]; then
+                sudo rm -f /etc/apt/sources.list.d/1password.list
+            fi
         else
             log_error "Failed to setup 1Password repository"
             FAILED_PACKAGES+=("1password - 1Password (repo setup failed)")
         fi
     fi
 
-    # Install Claude Code with Bedrock support
+    # Install Claude Code with Bedrock support.
+    # setup_ccb.sh is designed to be run by a normal user — it runs `sudo`
+    # internally for package installs. We run it as root with HOME pointed at
+    # the invoking user so its ~/.aws, ~/.claude, and shell RC edits land in
+    # the right place. Running via `sudo -u $SUDO_USER` would force a second
+    # password prompt because the nested sudo doesn't share our root session.
+    # Afterwards we chown anything it created back to the user.
     log_info "Setting up Claude Code with AWS Bedrock..."
     log_info "Running Claude Code Bedrock setup script (setup_ccb.sh)..."
     CCB_SCRIPT=$(mktemp /tmp/setup_ccb.XXXXXX.sh)
     if curl -fsSL "https://raw.githubusercontent.com/Albedo-Space-Corp/claude_code/refs/heads/main/setup_ccb.sh" -o "$CCB_SCRIPT" >> "$LOG_FILE" 2>&1; then
-        if sudo -u "$SUDO_USER" bash "$CCB_SCRIPT"; then
+        USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        if HOME="$USER_HOME" USER="$SUDO_USER" LOGNAME="$SUDO_USER" bash "$CCB_SCRIPT" 2>> "$LOG_FILE"; then
             log_success "Claude Code Bedrock setup completed successfully"
         else
             log_error "Claude Code Bedrock setup failed"
             FAILED_PACKAGES+=("claude - Claude Code Bedrock setup")
         fi
+        # Reclaim ownership of anything setup_ccb.sh created under the user's home
+        for path in .aws .claude .local/bin/jq .bashrc .zshrc; do
+            [ -e "$USER_HOME/$path" ] && chown -R "$SUDO_USER:" "$USER_HOME/$path" 2>/dev/null
+        done
         rm -f "$CCB_SCRIPT"
     else
         log_error "Failed to download Claude Code Bedrock setup script"
@@ -1283,8 +1331,13 @@ main() {
     # Check sudo
     check_sudo
     
-    # Print header
+    # Print header (first log_info call creates $LOG_FILE). Relax perms so the
+    # invoking user can read it later without sudo. Keep root as owner —
+    # Ubuntu's fs.protected_regular=2 blocks root from appending to files it
+    # doesn't own in world-writable sticky dirs like /tmp, so chown'ing mid-run
+    # would break every subsequent tee -a.
     log_info "Starting Albedo Linux Setup - Type: $SETUP_TYPE"
+    chmod 644 "$LOG_FILE" 2>/dev/null || true
     log_info "Log file: $LOG_FILE"
     echo ""
     
